@@ -15,7 +15,7 @@ A [Neorg](https://github.com/nvim-neorg/neorg) module for extracting and aggrega
 
 ```vim
 Plug 'nvim-neorg/neorg'
-Plug 'paulefoe/neorg-harvest'
+Plug 'paulefou/neorg-harvest'
 ```
 
 ### lazy.nvim
@@ -24,7 +24,7 @@ Plug 'paulefoe/neorg-harvest'
 {
     "nvim-neorg/neorg",
     dependencies = {
-        "paulefoe/neorg-harvest",
+        "paulefou/neorg-harvest",
     },
 }
 ```
