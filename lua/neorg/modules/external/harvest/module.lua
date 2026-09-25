@@ -67,6 +67,11 @@ end
 module.load = function()
     modules.await("core.neorgcmd", function(neorgcmd)
         neorgcmd.add_commands_from_table({
+            ["harvest-sessions"] = {
+                min_args = 1,
+                max_args = 1,
+                name = "harvest-sessions",
+            },
             harvest = {
                 min_args = 2,
                 max_args = 3,
@@ -89,7 +94,32 @@ module.config.public = {
     -- The name for the folder in which the journal files are located.
     -- This should match your core.journal configuration.
     journal_folder = "journal",
+
+    -- Anchors counted as personal deep work by `:Neorg harvest sessions <year>`.
+    session_anchors = { "OSTEP", "Rust" },
+
+    -- Minutes assumed for a session whose entries carry no explicit duration.
+    default_session_minutes = 90,
 }
+
+--- Duration units recognised at the start of a task line, in minutes.
+local DURATION_UNITS = {
+    m = 1, min = 1, mins = 1, minute = 1, minutes = 1,
+    h = 60, hr = 60, hrs = 60, hour = 60, hours = 60,
+}
+
+--- Parse a leading duration token: "90m ch.10 MLFQ" -> 90, "1.5h xv6" -> 90.
+--- Returns nil when the line does not begin with one, so ordinary task text
+--- like "004 migration guard" is not mistaken for a duration.
+---@param text string
+---@return number|nil minutes
+local function parse_minutes(text)
+    local num, unit = text:match("^(%d+%.?%d*)%s*(%a+)")
+    if not num then return nil end
+    local mult = DURATION_UNITS[unit:lower()]
+    if not mult then return nil end
+    return math.floor(tonumber(num) * mult + 0.5)
+end
 
 --- Iterate over all .norg files in a directory and call a callback for each
 ---@param dir_path string|PathlibPath Full path to directory
@@ -125,34 +155,26 @@ local function get_day_from_filename(file_path)
     return nil
 end
 
---- Find anchor and extract its children as individual task lines
----@param file_path string Full path to .norg file
+--- Collect the direct children of a list item whose text is exactly `anchor_name`.
+--- Shared by `harvest` and `harvest sessions`.
+---@param content string Full file contents
 ---@param anchor_name string Name to find (exact match)
----@param year string Year (e.g., "2025")
----@param month string Month (e.g., "12")
----@return table|nil List of {date = "DD.MM.YYYY", task = "task text"}
-local function find_anchor_children(file_path, anchor_name, year, month)
-    local file = io.open(file_path, "r")
-    if not file then
-        return nil
-    end
-    local content = file:read("*all")
-    file:close()
-
-    local day = get_day_from_filename(file_path)
-    if not day then return nil end
-
-    local date_str = string.format("%s.%s.%s", day, month, year)
+---@return string[] child_texts One cleaned first-line per nested child
+---@return string|nil state The anchor's own todo state character, e.g. "x" or " "
+local function collect_anchor_children(content, anchor_name)
+    local results = {}
+    local anchor_state = nil
 
     local parser = vim.treesitter.get_string_parser(content, "norg")
     local tree = parser:parse()[1]
-    if not tree then return nil end
+    if not tree then return results, nil end
     local root = tree:root()
+
+    local lines = vim.split(content, "\n")
 
     --- Get text content from a treesitter node
     local function get_text(node)
         local sr, sc, er, ec = node:range()
-        local lines = vim.split(content, "\n")
         if sr == er then
             return lines[sr + 1] and lines[sr + 1]:sub(sc + 1, ec) or ""
         else
@@ -177,8 +199,6 @@ local function find_anchor_children(file_path, anchor_name, year, month)
         return line
     end
 
-    local results = {}
-
     --- Recursively find a list item matching the anchor and extract its children
     local function find_list_item_with_anchor(node)
         local node_type = node:type()
@@ -190,6 +210,10 @@ local function find_anchor_children(file_path, anchor_name, year, month)
                 if child:type() == "paragraph" then
                     local para_text = get_text(child):gsub("^%s+", ""):gsub("%s+$", "")
                     if para_text == anchor_name then
+                        -- Record the anchor's own todo state, e.g. "- (x) Rust"
+                        local first_line = get_text(node):match("^[^\n]*") or ""
+                        anchor_state = first_line:match("^%s*%-+%s*%((.)%)")
+
                         -- Found the anchor! Now get nested children
                         local base_type = node_type:match("^(.+)%d+$")
 
@@ -200,10 +224,7 @@ local function find_anchor_children(file_path, anchor_name, year, month)
                                 local child_text = get_text(nested_child)
                                 local task_desc = get_first_line(child_text)
                                 if task_desc and #task_desc > 0 then
-                                    table.insert(results, {
-                                        date = date_str,
-                                        task = task_desc,
-                                    })
+                                    table.insert(results, task_desc)
                                 end
                             end
                         end
@@ -221,8 +242,48 @@ local function find_anchor_children(file_path, anchor_name, year, month)
     end
 
     find_list_item_with_anchor(root)
+    return results, anchor_state
+end
+
+--- Read a journal file and return its contents, or nil.
+---@param file_path string
+---@return string|nil
+local function read_file(file_path)
+    local file = io.open(file_path, "r")
+    if not file then return nil end
+    local content = file:read("*all")
+    file:close()
+    return content
+end
+
+--- Find anchor and extract its children as individual task lines
+---@param file_path string Full path to .norg file
+---@param anchor_name string Name to find (exact match)
+---@param year string Year (e.g., "2025")
+---@param month string Month (e.g., "12")
+---@return table|nil List of {date = "DD.MM.YYYY", task = "task text"}
+local function find_anchor_children(file_path, anchor_name, year, month)
+    local content = read_file(file_path)
+    if not content then return nil end
+
+    local day = get_day_from_filename(file_path)
+    if not day then return nil end
+
+    local date_str = string.format("%s.%s.%s", day, month, year)
+
+    local results = {}
+    for _, task in ipairs(collect_anchor_children(content, anchor_name)) do
+        table.insert(results, { date = date_str, task = task })
+    end
+
     return #results > 0 and results or nil
 end
+
+--- Number to month name, for the session log
+local MONTH_NAMES = {
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+}
 
 --- Month name to number mapping
 local months = {
@@ -328,11 +389,160 @@ module.public = {
             vim.notify("No tasks found for anchor: " .. anchor, vim.log.levels.WARN)
         end
     end,
+
+    --- Aggregate personal deep-work sessions for a whole year into one file.
+    --- `:Neorg harvest-sessions <year>` -> journal/<year>/sessions.norg
+    --- One session per anchor per day; minutes come from a leading duration
+    --- token on any child line, otherwise `default_session_minutes`.
+    ---@param year string|number e.g. 2026
+    harvest_sessions = function(year)
+        local workspace = module.config.public.workspace
+            or module.required["core.dirman"].get_current_workspace()[1]
+        local folder_name = module.config.public.journal_folder
+        local workspace_path = module.required["core.dirman"].get_workspace(workspace)
+
+        year = tostring(year)
+        if not year:match("^%d%d%d%d$") then
+            log.error("Invalid year. Use a four digit year, e.g. 2026")
+            return
+        end
+
+        local anchors = module.config.public.session_anchors
+        local default_minutes = module.config.public.default_session_minutes
+
+        local days = {}     -- sortable key "YYYYMMDD" -> { date = "DD.MM.YYYY", tracks = {} }
+        local totals = {}   -- anchor -> { sessions = n, minutes = n }
+        local grand = { sessions = 0, minutes = 0 }
+
+        for _, anchor_name in ipairs(anchors) do
+            totals[anchor_name] = { sessions = 0, minutes = 0 }
+        end
+
+        for month = 1, 12 do
+            local month_str = string.format("%02d", month)
+            local journal_dir = tostring(workspace_path)
+                .. config.pathsep .. folder_name
+                .. config.pathsep .. year
+                .. config.pathsep .. month_str
+
+            -- Months that have not happened yet are not a warning
+            if vim.loop.fs_stat(journal_dir) then
+            for_each_norg_file(journal_dir, function(file_path)
+                local day = get_day_from_filename(file_path)
+                -- Only DD.norg day files; skips harvest_*.norg and anything else
+                if not day or not day:match("^%d%d$") then return end
+
+                local content = read_file(file_path)
+                if not content then return end
+
+                for _, anchor_name in ipairs(anchors) do
+                    local children, state = collect_anchor_children(content, anchor_name)
+                    -- The (x) on the anchor is the whole record. Children are
+                    -- optional; they only matter if one carries a duration.
+                    -- "- ( ) Rust" is an intention, not a session.
+                    if state == "x" then
+                        local minutes, explicit = 0, false
+                        for _, child in ipairs(children) do
+                            local m = parse_minutes(child)
+                            if m then
+                                minutes = minutes + m
+                                explicit = true
+                            end
+                        end
+                        if not explicit then minutes = default_minutes end
+
+                        local key = year .. month_str .. day
+                        days[key] = days[key] or {
+                            date = string.format("%s %d",
+                                MONTH_NAMES[month], tonumber(day)),
+                            tracks = {},
+                            order = {},
+                        }
+                        if not days[key].tracks[anchor_name] then
+                            table.insert(days[key].order, anchor_name)
+                        end
+                        days[key].tracks[anchor_name] = minutes
+
+                        totals[anchor_name].sessions = totals[anchor_name].sessions + 1
+                        totals[anchor_name].minutes = totals[anchor_name].minutes + minutes
+                        grand.sessions = grand.sessions + 1
+                        grand.minutes = grand.minutes + minutes
+                    end
+                end
+            end)
+            end
+        end
+
+        local keys = {}
+        for key in pairs(days) do table.insert(keys, key) end
+        table.sort(keys)
+
+        local function hours(mins)
+            return string.format("%.1f h", mins / 60)
+        end
+
+        local out = {
+            "* Personal deep work - " .. year,
+            "",
+            "  Generated by `:Neorg harvest-sessions " .. year .. "`.",
+            "  Do not edit by hand - it is rebuilt from the journal anchors on every run.",
+            "",
+            "** Total",
+            string.format("   *%d sessions, %d minutes (%s)*",
+                grand.sessions, grand.minutes, hours(grand.minutes)),
+            "",
+        }
+
+        for _, anchor_name in ipairs(anchors) do
+            local t = totals[anchor_name]
+            table.insert(out, string.format("   - %s - %d session%s, %d minutes (%s)",
+                anchor_name, t.sessions, t.sessions == 1 and "" or "s",
+                t.minutes, hours(t.minutes)))
+        end
+
+        table.insert(out, "")
+        table.insert(out, "** Log")
+
+        if #keys == 0 then
+            table.insert(out, "   No sessions recorded yet.")
+        end
+
+        for _, key in ipairs(keys) do
+            local entry = days[key]
+            local parts = {}
+            for _, anchor_name in ipairs(entry.order) do
+                table.insert(parts, string.format("%d minutes %s",
+                    entry.tracks[anchor_name], anchor_name))
+            end
+            table.insert(out, string.format("   %s: %s", entry.date, table.concat(parts, ", ")))
+        end
+        table.insert(out, "")
+
+        module.required["core.dirman"].create_file(
+            folder_name .. config.pathsep .. year .. config.pathsep .. "sessions",
+            workspace
+        )
+
+        vim.schedule(function()
+            local buf = vim.api.nvim_get_current_buf()
+            -- Generated file: replace wholesale rather than append
+            vim.api.nvim_buf_set_lines(buf, 0, -1, false, out)
+            vim.cmd("write")
+
+            vim.notify(
+                string.format("%d sessions, %d minutes across %d days in %s",
+                    grand.sessions, grand.minutes, #keys, year),
+                vim.log.levels.INFO
+            )
+        end)
+    end,
 }
 
 module.on_event = function(event)
     if event.split_type[1] == "core.neorgcmd" then
-        if event.split_type[2] == "harvest" then
+        if event.split_type[2] == "harvest-sessions" then
+            module.public.harvest_sessions(event.content[1])
+        elseif event.split_type[2] == "harvest" then
             local anchor = event.content[1]
             local date_from = event.content[2]
             local date_to = event.content[3]
@@ -344,6 +554,7 @@ end
 module.events.subscribed = {
     ["core.neorgcmd"] = {
         ["harvest"] = true,
+        ["harvest-sessions"] = true,
     },
 }
 
